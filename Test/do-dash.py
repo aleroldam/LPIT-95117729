@@ -5,6 +5,8 @@ import polars as pl
 from dash import Dash, dcc, html, Input, Output
 import plotly.graph_objects as go
 
+# First run sim-live-data.py to create the data_live.txt live file
+
 data_file = "data_live.txt"
 n_cols = 10
 agg_period = 5
@@ -13,15 +15,15 @@ agg_period = 5
 # Shared queue
 # ============================================================
 
+# An asyncio queue will be used in the producer-consumer process
 queue = asyncio.Queue()
 
-# DataFrame where each row is one 5-second aggregated vector (10 values)
+# DataFrame where each row contains a 10-values vector with 5-seconds means
 agg_df = pl.DataFrame(
     schema= {f"v{i}": pl.Float64 for i in range(n_cols)}
 )
 
-
-# Last aggregated vector to show in Dash
+# Latest mean vector to show in Dash
 vector_list = [0.0] * 10
 
 # ============================================================
@@ -29,9 +31,9 @@ vector_list = [0.0] * 10
 # ============================================================
 
 # - Read new lines from a live data file
-# - Every 5 lines aggregate column-wise and adds the resulting vector
+# - Every 5 lines (5 seconds) aggregate column-wise and adds the resulting vector
 #   to the shared queue
-async def tail_file_producer(path: str, queue: asyncio.Queue):
+async def tail_file_producer(path: str, data_queue: asyncio.Queue):
 
     file = Path(path)
 
@@ -48,7 +50,7 @@ async def tail_file_producer(path: str, queue: asyncio.Queue):
         f.seek(0, 2)
 
         # Initialize the buffer and iterate until is filled with 5 data-rows
-        batch = []
+        buffer = []
 
         while True:
             line = f.readline()
@@ -61,13 +63,13 @@ async def tail_file_producer(path: str, queue: asyncio.Queue):
             values = [float(x) for x in line.strip().split(",")]
 
             # Add values to the buffer
-            batch.append(values)
+            buffer.append(values)
 
             print("Read values added to buffer:", values)
 
-            if len(batch) == agg_period:
-                # Create a DataFrame with this 5-row batch
-                df = pl.DataFrame(batch, schema=[f"v{i}" for i in range(n_cols)], orient="row")
+            if len(buffer) == agg_period:
+                # Create a DataFrame with this 5-row buffer
+                df = pl.DataFrame(buffer, schema=[f"v{i}" for i in range(n_cols)], orient="row")
 
                 # Aggregates and calculates the mean of each column
                 agg = df.select([pl.col(c).mean().alias(c) for c in df.columns])
@@ -77,8 +79,8 @@ async def tail_file_producer(path: str, queue: asyncio.Queue):
 
                 print("Aggregated values added to queue:", values)
 
-                await queue.put(vector)
-                batch = []
+                await data_queue.put(vector)
+                buffer = []
 
 # ============================================================
 # asyncio consumer
@@ -86,12 +88,12 @@ async def tail_file_producer(path: str, queue: asyncio.Queue):
 
 # Monitors the shared queue that contains the aggregated vectors
 # and appends these vectors to a DataFrame.
-async def consumer(queue: asyncio.Queue):
+async def consumer(data_queue: asyncio.Queue):
 
     global agg_df, vector_list
 
     while True:
-        vector_tuple = await queue.get()
+        vector_tuple = await data_queue.get()
 
         vector_list = list(vector_tuple)
         print("Consumed:", vector_list)
@@ -99,8 +101,7 @@ async def consumer(queue: asyncio.Queue):
         new_row = pl.DataFrame([vector_list], schema=agg_df.columns, orient="row")
         agg_df = pl.concat([agg_df, new_row], how="vertical")
 
-        queue.task_done()
-
+        data_queue.task_done()
 
 # ============================================================
 # Dash app
@@ -109,11 +110,10 @@ async def consumer(queue: asyncio.Queue):
 app = Dash(__name__)
 
 app.layout = html.Div([
-    html.H3("Last aggregated 5-second vector"),
+    html.H3("Mean values in a 5-second window"),
     dcc.Graph(id="live-graph"),
     dcc.Interval(id="interval", interval=5000, n_intervals=0),
 ])
-
 
 @app.callback(
     Output("live-graph", "figure"),
@@ -130,8 +130,8 @@ def update_graph(n):
     )
     fig.update_layout(
         xaxis_title="Index",
-        yaxis_title="Aggregated value",
-        title="Latest aggregated vector",
+        yaxis_title="Mean values",
+        title="Latest 5-second window",
     )
     return fig
 
@@ -153,5 +153,7 @@ async def main():
         debug=False,
     )
 
-if __name__ == "__main__":
+# Note: if app.run yields an error try changing the server port
+
+if __name__ == '__main__':
     asyncio.run(main())

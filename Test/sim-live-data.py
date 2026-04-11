@@ -33,7 +33,7 @@ def main():
     out_data_file = 'data_live.txt'
 
     print("- Source data file name: " + inp_data_file)
-    print("- Lve data file name: " + out_data_file)
+    print("- Live data file name: " + out_data_file)
     print("")
 
     key_int = False

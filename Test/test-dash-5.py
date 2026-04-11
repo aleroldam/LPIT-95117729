@@ -1,31 +1,29 @@
+from dash import Dash, html
+import dash_ag_grid as dag
+import polars as pl
 
-from dash import Dash, dcc, html, Input, Output
-import plotly.express as px
+# ==================================
+# Dash example with gapminder2007 dataset @ https://raw.githubusercontent.com/plotly/datasets/master/gapminder2007.csv
+# - Basic grid table with Polars DataFrame
+# ==================================
 
-app = Dash(__name__)
+# Read data
+df = pl.read_csv('gapminder2007.csv')
 
-app.layout = html.Div([
-    html.H4('Analysis of Iris data using scatter matrix'),
-    dcc.Dropdown(
-        id="plotly-express-x-dropdown",
-        options=['sepal_length', 'sepal_width', 
-                 'petal_length', 'petal_width'],
-        value=['sepal_length', 'sepal_width'],
-        multi=True
-    ),
-    dcc.Graph(id="plotly-express-x-graph"),
-])
+# Initialize the app
+app = Dash()
 
-@app.callback(
-    Output("plotly-express-x-graph", "figure"),
-    Input("plotly-express-x-dropdown", "value"))
-def update_bar_chart(dims):
-    df = px.data.iris() # replace with your own data source
-    fig = px.scatter_matrix(
-        df, dimensions=dims, color="species")
-    return fig
+# App layout
+app.layout = [
+    html.Div(children='Dash app with data (Polars DataFrame)'),
+    dag.AgGrid(
+        rowData=df.to_dicts(),
+        columnDefs=[{"field": i} for i in df.columns]
+    )
+]
 
-if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8055, debug=False)
+# Note: if app.run yields an error try changing the server port
 
+if __name__ == '__main__':
+    app.run(host="127.0.0.1", port=8060, debug=False)
 

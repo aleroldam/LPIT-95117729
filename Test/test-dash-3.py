@@ -2,7 +2,12 @@ from dash import Dash, html, dcc, Input, Output
 import plotly.express as px
 import polars as pl
 
+# ==================================
+# Dash example with basic dataset
+# - Basic graph with two series
+# ==================================
 
+# Create Polars DataFrame
 df = pl.DataFrame({
     "x": [1, 2, 3, 4, 5],
     "A": [10, 15, 13, 17, 20],
@@ -34,12 +39,14 @@ app.layout = html.Div([
 def update_chart(selected_series):
         
     fig = px.line(
-        x=df["x"].to_list(),
-        y=df[selected_series].to_list(),
+        x=df.get_column("x").to_list(),
+        y=df.get_column(selected_series).to_list(),
         markers=True,
         title=f"Showing {selected_series}",
     )
     return fig
 
+# Note: if app.run yields an error try changing the server port
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8050, debug=False)
+    app.run(host="127.0.0.1", port=8057, debug=False)

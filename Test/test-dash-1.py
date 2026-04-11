@@ -1,5 +1,9 @@
 import plotly.graph_objects as go
 
+# ==================================
+# Plotly example
+# ==================================
+
 # Sample data
 x = [1, 2, 3, 4, 5]
 y = [10, 15, 13, 17, 20]

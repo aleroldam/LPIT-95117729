@@ -1,24 +1,35 @@
-
-from dash import Dash, html
-import dash_ag_grid as dag
+from dash import Dash, html, dcc, callback, Output, Input
+import plotly.express as px
 import polars as pl
 
-# Incorporate data
-df = pl.read_csv('https://raw.githubusercontent.com/plotly/datasets/master/gapminder2007.csv')
+# ==================================
+# Dash example with gapminder_unfiltered dataset @ https://raw.githubusercontent.com/plotly/datasets/master/gapminder_unfiltered.csv
+# - Basic graph with Polars DataFrame
+# ==================================
+
+# Read data
+df = pl.read_csv('gapminder_unfiltered.csv')
 
 # Initialize the app
 app = Dash()
 
 # App layout
 app.layout = [
-    html.Div(children='Dash app with data'),
-    dag.AgGrid(
-        rowData=df.to_dicts(),
-        columnDefs=[{"field": i} for i in df.columns]
-    )
+    html.H1(children='Dash app with data', style={'textAlign':'center'}),
+    dcc.Dropdown(df["country"].unique().to_list(), 'Canada', id='dropdown-selection'),
+    dcc.Graph(id='graph-content')
 ]
 
-# Run the app
+@callback(
+    Output('graph-content', 'figure'),
+    Input('dropdown-selection', 'value')
+)
+def update_graph(value):
+    dff = df.filter(pl.col("country")==value)
+    return px.line(dff, x='year', y='pop')
+
+# Note: if app.run yields an error try changing the server port
+
 if __name__ == '__main__':
-    app.run(host="127.0.0.1", port=8056, debug=False)
+    app.run(host="127.0.0.1", port=8061, debug=False)
 
