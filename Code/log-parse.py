@@ -5,16 +5,17 @@ from datetime import datetime
 import time
 
 import polars as pl
+import pandas as pd
 from dash import Dash, dcc, html, Input, Output
 import plotly.express as px
 
+# ==============================================================================
 # Configuración
+# ==============================================================================
 LOG_FILE = "cu-lan-ho-live.log"
 PARQUET_FILE = "volumenes_agregados.parquet"
 
-
 # OBJETIVO 2: Identificar los mensajes SDAP (Tráfico DL)
-# ==============================================================================
 PATTERN_SDAP = re.compile(
     r'^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})\s+\[SDAP\s*\]\s+\[.\]\s+ue=(?P<ue_id>\d+).*DL:.*pdu_len=(?P<dl_vol>\d+)'
 )
@@ -114,8 +115,8 @@ async def parquet_saver():
         await asyncio.sleep(30) # Esperar 30 segundos
         
         if not agg_df.is_empty():
-            print(f"[{datetime.now().time()}] Guardando evolución en {PARQUET_FILE}...")
-            # Guardar sobrescribiendo o añadiendo (Polars no añade a parquet nativamente fácil, sobrescribimos el histórico)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Guardando evolución en {PARQUET_FILE}...")
+            # Guardar sobrescribiendo el histórico
             agg_df.write_parquet(PARQUET_FILE)
             print("Guardado exitoso.")
 
@@ -139,31 +140,54 @@ def update_graph(n):
     if agg_df.is_empty():
         return px.line(title="Esperando datos...")
 
-    # --- LA SOLUCIÓN ESTÁ AQUÍ ---
-    # Ordenar estrictamente el DataFrame de Polars por tiempo
-    sorted_df = agg_df.sort("time_window")
-    # -----------------------------
+    # 1. Consolidar el DataFrame histórico para fusionar cualquier segundo
+    # que el buffer haya guardado fragmentado y evitar duplicados
+    consolidated_df = (
+        agg_df.group_by(["time_window", "ue_id"])
+        .agg(pl.col("dl_vol_sum").sum())
+        .sort("time_window")
+    )
 
-    # Convertir a Pandas el DataFrame ya ordenado
-    df_pd = sorted_df.to_pandas()
+    # 2. Convertir a Pandas para procesar huecos de tiempo
+    df_pd = consolidated_df.to_pandas()
     
-    # Crear gráfico de líneas (ahora ya vendrá ordenado)
+    # 3. Lógica de relleno con ceros (Resampling)
+    # Pivotamos: el tiempo como índice y los UE como columnas
+    df_pivot = df_pd.pivot(index='time_window', columns='ue_id', values='dl_vol_sum')
+    
+    # Forzamos frecuencia de 1 segundo exacto y rellenamos huecos (NaN) con 0
+    df_pivot = df_pivot.resample('1s').asfreq().fillna(0)
+    
+    # Derretimos (Melt) para volver al formato necesario para Plotly
+    df_final = df_pivot.reset_index().melt(
+        id_vars='time_window', 
+        value_name='dl_vol_sum', 
+        var_name='ue_id'
+    )
+    
+    # 4. Crear gráfico de líneas
     fig = px.line(
-        df_pd, 
+        df_final, 
         x="time_window", 
         y="dl_vol_sum", 
         color="ue_id",
         markers=True,
-        title="Tráfico DL Agregado (1s) por User Equipment (Corregido)",
+        title="Tráfico DL Agregado (1s) por User Equipment",
         labels={"time_window": "Tiempo", "dl_vol_sum": "Volumen Total (Bytes)"}
     )
+    
+    # Forzar que el eje Y siempre empiece en 0
+    fig.update_layout(yaxis_rangemode="tozero")
+    
     return fig
 
 # ==============================================================================
 # Main Loop
 # ==============================================================================
 async def main():
-    print("Iniciando Pipeline Fase 1...")
+    print("■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■")
+    print("Pipeline Fase 1 :: Ingesta, Agregación y Dash")
+    print("■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■\n")
     
     # Iniciar las tareas asíncronas en segundo plano
     asyncio.create_task(log_reader_producer(LOG_FILE, data_queue))
