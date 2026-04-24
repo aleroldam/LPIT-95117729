@@ -15,120 +15,127 @@ import plotly.express as px
 LOG_FILE = "cu-lan-ho-live.log"
 PARQUET_FILE = "volumenes_agregados.parquet"
 
-# OBJETIVO 2: Identificar los mensajes SDAP (Tráfico DL)
+# PATRONES REGEX ACTUALIZADOS
+# 1. Patrón SDAP (Volumen)
 PATTERN_SDAP = re.compile(
-    r'^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})\s+\[SDAP\s*\]\s+\[.\]\s+ue=(?P<ue_id>\d+).*DL:.*pdu_len=(?P<dl_vol>\d+)'
+    r'^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}).*\[SDAP\s*\].*ue=(?P<ue_id>\d+).*DL:.*pdu_len=(?P<dl_vol>\d+)'
 )
 
-# Colas y Variables Globales Compartidas
-data_queue = asyncio.Queue()
+# 2. Patrón de Contexto (PCI, PLMN, RNTI)
+# Extrae ue_id, plmn, pci y rnti de la misma línea de creación [CU-UEMNG]
+PATTERN_CONTEXT = re.compile(
+    r'ue=(?P<ue_id>\d+).*?plmn=(?P<plmn>\d+).*?pci=(?P<pci>\d+).*?rnti=(?P<rnti>0x[0-9a-fA-F]+)'
+)
 
-# OBJETIVO 3: Almacenamiento de datos crudos (en memoria temporalmente por eficiencia)
+# Colas y Variables Globales
+data_queue = asyncio.Queue()
 raw_buffer = [] 
 
-# OBJETIVO 4: DataFrame de datos agregados (Global para que Dash lo lea)
-# Esquema: time_window (datetime), ue_id (str), dl_vol_sum (float)
-agg_df = pl.DataFrame(schema={"time_window": pl.Datetime, "ue_id": pl.Utf8, "dl_vol_sum": pl.Float64})
+# Diccionario para mantener el estado de cada UE (PLMN, PCI, RNTI)
+ue_metadata = {} 
+
+# Esquema actualizado para incluir metadatos
+agg_df = pl.DataFrame(schema={
+    "time_window": pl.Datetime, 
+    "ue_id": pl.Utf8, 
+    "dl_vol_sum": pl.Float64,
+    "pci": pl.Utf8,
+    "plmn": pl.Utf8,
+    "rnti": pl.Utf8
+})
 
 # ==============================================================================
-# OBJETIVO 1 & 2: Productor - Leer en tiempo real e identificar
+# OBJETIVO 1 & 2: Productor - Leer, Identificar y Asociar Metadatos
 # ==============================================================================
 async def log_reader_producer(path: str, queue: asyncio.Queue):
     file = Path(path)
-    print(f"Esperando a que se genere el log: {path}...")
+    print(f"Esperando log: {path}...")
 
     while not file.exists():
         await asyncio.sleep(0.5)
 
     with open(path, "r", encoding="utf-8") as f:
-        print(f"Log {path} abierto. Leyendo en tiempo real...")
-        f.seek(0, 2)  # Ir al final del archivo (tail -f)
-
+        f.seek(0, 2)
         while True:
             line = f.readline()
             if not line:
                 await asyncio.sleep(0.1)
                 continue
 
-            # Buscar patrón SDAP en la línea
-            match = PATTERN_SDAP.search(line)
-            if match:
-                data = match.groupdict()
-                # Parsear los datos
+            # A. Buscar información de contexto (PCI, PLMN, RNTI)
+            match_ctx = PATTERN_CONTEXT.search(line)
+            if match_ctx:
+                d = match_ctx.groupdict()
+                uid = d['ue_id']
+                if uid not in ue_metadata:
+                    ue_metadata[uid] = {"pci": "N/A", "plmn": "N/A", "rnti": "N/A"}
+                
+                # Actualizar solo el campo que ha venido en la línea
+                if d.get('pci'): ue_metadata[uid]['pci'] = d['pci']
+                if d.get('plmn'): ue_metadata[uid]['plmn'] = d['plmn']
+                if d.get('rnti'): ue_metadata[uid]['rnti'] = d['rnti']
+
+            # B. Buscar volumen SDAP
+            match_sdap = PATTERN_SDAP.search(line)
+            if match_sdap:
+                data = match_sdap.groupdict()
+                uid = data["ue_id"]
+                
+                # Recuperar metadatos guardados o usar N/A
+                meta = ue_metadata.get(uid, {"pci": "N/A", "plmn": "N/A", "rnti": "N/A"})
+                
                 record = {
                     "timestamp": datetime.fromisoformat(data["timestamp"]),
-                    "ue_id": f"UE_{data['ue_id']}",
-                    "dl_vol": float(data["dl_vol"])
+                    "ue_id": f"UE_{uid}",
+                    "dl_vol": float(data["dl_vol"]),
+                    "pci": meta['pci'],
+                    "plmn": meta['plmn'],
+                    "rnti": meta['rnti']
                 }
                 await queue.put(record)
 
 # ==============================================================================
-# OBJETIVO 3 & 4: Consumidor - Guardar crudo y Agregar cada 1 segundo
+# OBJETIVO 3 & 4: Agregación (Incluyendo metadatos)
 # ==============================================================================
 async def data_aggregator_consumer(queue: asyncio.Queue):
     global raw_buffer, agg_df
-    
     last_agg_time = time.time()
 
     while True:
-        # Recibir dato de la cola (espera máximo 0.5s para no bloquear la agregación)
         try:
             record = await asyncio.wait_for(queue.get(), timeout=0.5)
-            raw_buffer.append(record)  # Guardar crudo (Objetivo 3)
+            raw_buffer.append(record)
             queue.task_done()
         except asyncio.TimeoutError:
-            pass # No llegaron datos nuevos en este medio segundo, continuamos
+            pass
 
-        current_time = time.time()
-        
-        # Agregar cada 1 segundo (Objetivo 4)
-        if current_time - last_agg_time >= 1.0:
+        if time.time() - last_agg_time >= 1.0:
             if raw_buffer:
-                # Convertir buffer crudo a DataFrame
                 df_raw = pl.DataFrame(raw_buffer)
+                df_raw = df_raw.with_columns(pl.col("timestamp").dt.truncate("1s").alias("time_window"))
                 
-                # Truncar los timestamps al segundo para agrupar
-                df_raw = df_raw.with_columns(
-                    pl.col("timestamp").dt.truncate("1s").alias("time_window")
-                )
-                
-                # Agrupar por ventana de 1 segundo y por UE, sumar el volumen
+                # Agregamos sumando volumen pero manteniendo PCI, PLMN y RNTI (usamos el último conocido)
                 df_grouped = (
                     df_raw.group_by(["time_window", "ue_id"])
-                    .agg(pl.col("dl_vol").sum().alias("dl_vol_sum"))
+                    .agg([
+                        pl.col("dl_vol").sum().alias("dl_vol_sum"),
+                        pl.col("pci").last(),
+                        pl.col("plmn").last(),
+                        pl.col("rnti").last()
+                    ])
                 )
-
-                # Unir al DataFrame global agregado
                 agg_df = pl.concat([agg_df, df_grouped], how="vertical")
-                
-                # Limpiar el buffer crudo para el siguiente segundo
                 raw_buffer = []
-                
-            last_agg_time = current_time
+            last_agg_time = time.time()
 
 # ==============================================================================
-# OBJETIVO 6: Guardar en Parquet cada 30 segundos
-# ==============================================================================
-async def parquet_saver():
-    global agg_df
-    while True:
-        await asyncio.sleep(30) # Esperar 30 segundos
-        
-        if not agg_df.is_empty():
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Guardando evolución en {PARQUET_FILE}...")
-            # Guardar sobrescribiendo el histórico
-            agg_df.write_parquet(PARQUET_FILE)
-            print("Guardado exitoso.")
-
-# ==============================================================================
-# OBJETIVO 5: Representar en tiempo real con Dash
+# OBJETIVO 5: Representar en Dash con info de PLMN, PCI, RNTI
 # ==============================================================================
 app = Dash(__name__)
-
 app.layout = html.Div([
-    html.H3("Evolución de Volúmenes DL SDAP por UE"),
+    html.H3("Monitorización SDAP DL - Info de Red por UE"),
     dcc.Graph(id="live-graph"),
-    dcc.Interval(id="interval-component", interval=1000, n_intervals=0) # Actualizar cada 1s
+    dcc.Interval(id="interval-component", interval=1000, n_intervals=0)
 ])
 
 @app.callback(
@@ -140,67 +147,54 @@ def update_graph(n):
     if agg_df.is_empty():
         return px.line(title="Esperando datos...")
 
-    # 1. Consolidar el DataFrame histórico para fusionar cualquier segundo
-    # que el buffer haya guardado fragmentado y evitar duplicados
+    # Consolidar y ordenar
     consolidated_df = (
         agg_df.group_by(["time_window", "ue_id"])
-        .agg(pl.col("dl_vol_sum").sum())
-        .sort("time_window")
+        .agg([
+            pl.col("dl_vol_sum").sum(),
+            pl.col("pci").last(),
+            pl.col("plmn").last(),
+            pl.col("rnti").last()
+        ]).sort("time_window")
     )
 
-    # 2. Convertir a Pandas para procesar huecos de tiempo
     df_pd = consolidated_df.to_pandas()
     
-    # 3. Lógica de relleno con ceros (Resampling)
-    # Pivotamos: el tiempo como índice y los UE como columnas
-    df_pivot = df_pd.pivot(index='time_window', columns='ue_id', values='dl_vol_sum')
-    
-    # Forzamos frecuencia de 1 segundo exacto y rellenamos huecos (NaN) con 0
-    df_pivot = df_pivot.resample('1s').asfreq().fillna(0)
-    
-    # Derretimos (Melt) para volver al formato necesario para Plotly
-    df_final = df_pivot.reset_index().melt(
-        id_vars='time_window', 
-        value_name='dl_vol_sum', 
-        var_name='ue_id'
+    # Crear una columna combinada para la leyenda
+    df_pd["UE_Info"] = (
+        df_pd["ue_id"] + 
+        " (RNTI: " + df_pd["rnti"] + 
+        ", PCI: " + df_pd["pci"] + 
+        ", PLMN: " + df_pd["plmn"] + ")"
     )
-    
-    # 4. Crear gráfico de líneas
+
+    # Gráfico con la nueva etiqueta informativa
     fig = px.line(
-        df_final, 
+        df_pd, 
         x="time_window", 
         y="dl_vol_sum", 
-        color="ue_id",
+        color="UE_Info", # <--- Aquí mostramos toda la info
         markers=True,
-        title="Tráfico DL Agregado (1s) por User Equipment",
-        labels={"time_window": "Tiempo", "dl_vol_sum": "Volumen Total (Bytes)"}
+        title="Tráfico DL con Metadatos de Red",
+        labels={"time_window": "Tiempo", "dl_vol_sum": "Bytes"}
     )
-    
-    # Forzar que el eje Y siempre empiece en 0
-    fig.update_layout(yaxis_rangemode="tozero")
-    
+    fig.update_layout(yaxis_rangemode="tozero", legend=dict(orientation="h", y=-0.2))
     return fig
 
-# ==============================================================================
-# Main Loop
-# ==============================================================================
+# [Resto de funciones: parquet_saver y main permanecen igual...]
+async def parquet_saver():
+    global agg_df
+    while True:
+        await asyncio.sleep(30)
+        if not agg_df.is_empty():
+            agg_df.write_parquet(PARQUET_FILE)
+
 async def main():
-    print("■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■")
-    print("Pipeline Fase 1 :: Ingesta, Agregación y Dash")
-    print("■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■\n")
-    
-    # Iniciar las tareas asíncronas en segundo plano
+    print("Iniciando Pipeline con Metadatos (PCI/PLMN/RNTI)...")
     asyncio.create_task(log_reader_producer(LOG_FILE, data_queue))
     asyncio.create_task(data_aggregator_consumer(data_queue))
     asyncio.create_task(parquet_saver())
-
-    # Ejecutar Dash en un hilo separado
-    await asyncio.to_thread(
-        app.run,
-        host="127.0.0.1",
-        port=8050,
-        debug=False,
-    )
+    await asyncio.to_thread(app.run, host="127.0.0.1", port=8050, debug=False)
 
 if __name__ == '__main__':
     asyncio.run(main())
